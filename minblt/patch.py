@@ -3,6 +3,25 @@
 from dataclasses import dataclass
 import math
 
+import torch
+
+
+def patch_mask(query_ids, key_ids, window=None):
+    """Reference cross-attention ALLOW mask [1,Q,K], before K-way expansion."""
+    distance = query_ids[:, None] - key_ids[None, :]
+    if window is None:
+        return (distance == 0)[None]
+    if window < 1:
+        raise ValueError("Cross-attention window must be positive")
+    return ((distance >= 0) & (distance < window))[None]
+
+
+def decoder_patch_ids(patches):
+    # Drop the singleton initial encoder patch, as in Meta's lag correction.
+    if not patches.lengths or patches.lengths[0] != 1:
+        raise ValueError("Decoder alignment requires a singleton initial encoder patch")
+    return [j for j, n in enumerate(patches.lengths[1:]) for _ in range(n)]
+
 
 @dataclass
 class Patches:
@@ -27,6 +46,10 @@ class Patches:
     def average(self):
         return len(self.ids) / len(self.starts) if self.starts else 0.0
 
+    def with_bos(self):
+        """Payload patches -> encoder patches for [BOS] + payload bytes."""
+        return Patches.build([0] + [s+1 for s in self.starts], len(self.ids)+1)
+
 
 class FixedPatcher:
     def __init__(self, patch_size=4):
@@ -39,15 +62,20 @@ class FixedPatcher:
 
 
 class EntropyPatcher:
-    def __init__(self, model, threshold, policy="global", max_patch_length=None):
+    def __init__(self, model, threshold, policy="global", max_patch_length=None, entropy_mode="prefix"):
         if policy not in ("global", "relative") or not math.isfinite(threshold):
             raise ValueError("Expected a global or relative policy and finite threshold")
         if max_patch_length is not None and max_patch_length < 1:
             raise ValueError("Maximum patch length must be positive")
         self.model, self.threshold = model, float(threshold)
         self.policy, self.max_patch_length = policy, max_patch_length
+        if entropy_mode not in ("prefix", "parallel"):
+            raise ValueError("Entropy mode must be prefix or parallel")
+        self.entropy_mode = entropy_mode
         if model is not None:
             model.eval().requires_grad_(False)
+            for parameter in model.parameters():
+                parameter.grad = None
 
     def from_entropies(self, entropies):
         h = [float(v) for v in entropies]
@@ -57,20 +85,23 @@ class EntropyPatcher:
         for t in range(1, len(h)):
             score = h[t] if self.policy == "global" else h[t] - h[t-1]
             capped = self.max_patch_length is not None and t-starts[-1] >= self.max_patch_length
-            if score > self.threshold or capped:
+            # Meta's monotonic helper forces the first surviving candidate.
+            # After removing the singleton BOS patch, this is payload byte 1.
+            initial_relative = self.policy == "relative" and t == 1
+            if score > self.threshold or capped or initial_relative:
                 starts.append(t)
         return Patches.build(starts, len(h))
 
     def __call__(self, values):
         if self.model is None:
             raise ValueError("A trained entropy model is required for byte patching")
-        return self.from_entropies(self.model.entropies(values).tolist())
+        return self.from_entropies(self.model.entropies(values, mode=self.entropy_mode).tolist())
 
     def calibrate(self, values, target_patch_size=4):
         """Fit a global threshold once; discrete ties may prevent an exact target."""
         if self.policy != "global" or target_patch_size < 1 or not len(values):
             raise ValueError("Calibration needs nonempty bytes, global policy and target >= 1")
-        h = self.model.entropies(values).tolist()
+        h = self.model.entropies(values, mode=self.entropy_mode).tolist()
         low, high = min(h)-1e-6, max(h)+1e-6
         best = (float("inf"), self.threshold)
         for _ in range(40):

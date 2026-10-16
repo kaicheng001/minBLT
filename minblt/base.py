@@ -6,7 +6,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-BOS = PAD = 256  # Internal only; the prediction head always has 256 classes.
+# Public tensors hold bytes 0..255 and right padding 256. Internally use Meta's
+# offset-byte arrangement: BOE=0, BOS=1, EOS=2, reserved=3, bytes=4..259.
+PAD = 256
+BOE, BOS, EOS, OFFSET = 0, 1, 2, 4
 
 
 def encode(text):
@@ -30,7 +33,7 @@ def validate_bytes(x):
 
 def shifted(x):
     # Target x[t] is predicted from BOS, x[0], ..., x[t-1].
-    return torch.cat((torch.full_like(x[:, :1], BOS), x[:, :-1]), dim=1)
+    return torch.cat((torch.full_like(x[:, :1], BOS), x[:, :-1] + OFFSET), dim=1)
 
 
 def byte_loss(logits, targets):
@@ -42,22 +45,38 @@ def byte_loss(logits, targets):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
     def forward(self, x):
-        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * self.weight
+        return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype) * self.weight
+
+
+def rope(x, theta=10000.0):
+    """Rotate adjacent coordinate pairs in [B,H,T,D], as in Meta's RoPE path."""
+    dim = x.shape[-1]
+    if dim % 2:
+        raise ValueError("RoPE requires an even head dimension")
+    frequencies = theta ** (-torch.arange(0, dim, 2, device=x.device).float()/dim)
+    angles = torch.arange(x.shape[-2], device=x.device).float()[:, None] * frequencies
+    cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+    a, b = x[..., 0::2], x[..., 1::2]
+    return torch.stack((a*cos-b*sin, a*sin+b*cos), dim=-1).flatten(-2)
 
 
 class Attention(nn.Module):
     """[B,Q,D] queries, [B,K,C] context, [B,Q,K] Boolean ALLOW mask."""
 
-    def __init__(self, dim, heads=4, context_dim=None):
+    def __init__(self, dim, heads=4, context_dim=None, rotary=False, rope_theta=10000.0):
         super().__init__()
         if dim % heads:
             raise ValueError("Attention width must be divisible by head count")
         self.heads = heads
+        self.rotary, self.rope_theta = rotary, rope_theta
+        if rotary and (dim // heads) % 2:
+            raise ValueError("RoPE requires an even head dimension")
         context_dim = context_dim or dim
         self.q = nn.Linear(dim, dim, bias=False)
         self.k = nn.Linear(context_dim, dim, bias=False)
@@ -68,17 +87,17 @@ class Attention(nn.Module):
         b, q, d = x.shape
         def split(t):
             return t.reshape(b, -1, self.heads, d // self.heads).transpose(1, 2)
-        scores = split(self.q(x)) @ split(self.k(context)).transpose(-1, -2)
-        scores = scores / math.sqrt(d // self.heads)
-        # Empty rows (only padding queries) yield zero attention, never NaNs.
-        mask = allow[:, None]
-        weights = scores.masked_fill(~mask, torch.finfo(scores.dtype).min).softmax(-1)
-        weights = weights * mask
-        values = weights @ split(self.v(context))
+        query, key, value = split(self.q(x)), split(self.k(context)), split(self.v(context))
+        if self.rotary:
+            query, key = rope(query, self.rope_theta), rope(key, self.rope_theta)
+        # SDPA Boolean True means allow. Empty query rows produce zero output.
+        values = F.scaled_dot_product_attention(query, key, value, attn_mask=allow[:, None])
         return self.out(values.transpose(1, 2).reshape(b, q, d))
 
 
 def causal_mask(valid, window=None):
+    if window is not None and window < 1:
+        raise ValueError("Attention window must be positive")
     t = torch.arange(valid.shape[1], device=valid.device)
     distance = t[:, None] - t[None, :]
     mask = distance >= 0
@@ -87,21 +106,38 @@ def causal_mask(valid, window=None):
     return mask[None] & valid[:, :, None] & valid[:, None, :]
 
 
-def positions(x):
-    # Analytic sinusoidal positions avoid a learned maximum context length.
-    t = torch.arange(x.shape[1], device=x.device, dtype=x.dtype)[:, None]
-    frequencies = torch.exp(-math.log(10000) * torch.arange(
-        0, x.shape[-1], 2, device=x.device, dtype=x.dtype) / x.shape[-1])
-    angles = t * frequencies
-    return torch.stack((angles.sin(), angles.cos()), -1).flatten(-2)[..., :x.shape[-1]]
+class FeedForward(nn.Module):
+    """Bias-free SwiGLU, with the reference 8D/3 hidden-width rule."""
+
+    def __init__(self, dim, multiple_of=8):
+        super().__init__()
+        hidden = multiple_of * math.ceil(int(8*dim/3) / multiple_of)
+        self.gate = nn.Linear(dim, hidden, bias=False)
+        self.value = nn.Linear(dim, hidden, bias=False)
+        self.out = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x):
+        return self.out(F.silu(self.gate(x)) * self.value(x))
+
+
+class CrossAttention(nn.Module):
+    """Normalized patch cross-attention, without RoPE; one residual per paper."""
+
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.query_norm, self.context_norm = RMSNorm(dim), RMSNorm(dim)
+        self.attention = Attention(dim, heads)
+
+    def forward(self, x, context, allow):
+        return x + self.attention(self.query_norm(x), self.context_norm(context), allow)
 
 
 class Block(nn.Module):
-    def __init__(self, dim, heads=4):
+    def __init__(self, dim, heads=4, rope_theta=10000.0):
         super().__init__()
         self.norm1, self.norm2 = RMSNorm(dim), RMSNorm(dim)
-        self.attention = Attention(dim, heads)
-        self.ff = nn.Sequential(nn.Linear(dim, 4*dim), nn.GELU(), nn.Linear(4*dim, dim))
+        self.attention = Attention(dim, heads, rotary=True, rope_theta=rope_theta)
+        self.ff = FeedForward(dim)
 
     def forward(self, x, allow):
         h = self.norm1(x)

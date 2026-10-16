@@ -1,6 +1,9 @@
 import math
 import hashlib
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -8,7 +11,7 @@ import torch
 from minblt.base import byte_loss, decode, encode
 from minblt.patch import EntropyPatcher, FixedPatcher, Patches, visualize_patches
 from minblt.entropy import TinyEntropyModel
-from minblt.model import ByteLatentTransformer
+from minblt import ByteLatentTransformer
 
 
 torch.set_num_threads(1)
@@ -34,7 +37,7 @@ def test_fixed(size, lengths):
 def test_entropy_rules():
     h = [1.0, 1.2, 3.0, 2.0, 3.5]
     assert EntropyPatcher(None, 2.5).from_entropies(h).starts == [0, 2, 4]
-    assert EntropyPatcher(None, 1.0, policy="relative").from_entropies(h).starts == [0, 2, 4]
+    assert EntropyPatcher(None, 1.0, policy="relative").from_entropies(h).starts == [0, 1, 2, 4]
     assert EntropyPatcher(None, 4, max_patch_length=2).from_entropies(h).starts == [0, 2, 4]
     assert EntropyPatcher(None, 3.0).from_entropies([3., 3.]).starts == [0]
     assert "average" in visualize_patches(b"abcdef", FixedPatcher(2)(b"abcdef"))
@@ -161,7 +164,8 @@ def test_global_influence_and_single_patch():
         for p in model.global_model.parameters():
             p.add_(torch.randn_like(p)*0.3)
     after = model(x, FixedPatcher(2))[0]
-    torch.testing.assert_close(before[:, :2], after[:, :2])
+    # The singleton BOS patch is processed globally and conditions the first patch.
+    assert (before[:, :2] - after[:, :2]).abs().max() > 1e-4
     assert (before[:, 2:] - after[:, 2:]).abs().max() > 1e-4
     assert model(torch.tensor([[1]]), FixedPatcher(10))[0].shape == (1, 1, 256)
 
@@ -195,18 +199,13 @@ def test_dynamic_generation_alignment():
 
 
 def test_entropy_checkpoint_roundtrip(tmp_path):
-    from demo import load_checkpoint
-    from train import pack
-
     model = small_model()
     entropy = TinyEntropyModel(dim=16)
     patcher = EntropyPatcher(entropy, 5.35, max_patch_length=4)
-    checkpoint = pack(model)
-    checkpoint.update(entropy=pack(entropy), patcher=dict(
-        mode="entropy", threshold=5.35, policy="global", max_patch_length=4))
     path = tmp_path / "blt.pt"
-    torch.save(checkpoint, path)
-    restored, restored_patcher = load_checkpoint(path)
+    model.save(path, patcher, metadata={"seed": 8})
+    restored, restored_patcher, metadata = ByteLatentTransformer.load(path)
+    assert model.config == restored.config and metadata == {"seed": 8}
     raw = b"bytes and patches"
     assert patcher(raw) == restored_patcher(raw)
     assert not any(p.requires_grad for p in restored_patcher.model.parameters())
@@ -220,17 +219,17 @@ def test_entropy_checkpoint_roundtrip(tmp_path):
 
 def test_hash_and_patch_pool_membership():
     model = small_model()
-    x = torch.tensor([list(b"abcdefgh")])
+    x = torch.tensor([[1]+[v+4 for v in b"abcdefgh"]])
     changed = x.clone()
-    changed[:, 4:] += 10
-    torch.testing.assert_close(model.encoder.hash(x)[:, :4], model.encoder.hash(changed)[:, :4])
-    patches = FixedPatcher(4)(x[0].tolist())
+    changed[:, 5:] += 10
+    torch.testing.assert_close(model.encoder.hash(x)[:, :5], model.encoder.hash(changed)[:, :5])
+    patches = FixedPatcher(4)(b"abcdefgh").with_bos()
     _, original = model.encoder(x, patches)
     _, mutated = model.encoder(changed, patches)
-    torch.testing.assert_close(original[:, :1], mutated[:, :1])
-    assert (original[:, 1:] - mutated[:, 1:]).abs().max() > 0
+    torch.testing.assert_close(original[:, :2], mutated[:, :2])
+    assert (original[:, 2:] - mutated[:, 2:]).abs().max() > 0
     # No hash tables is a supported, deterministic ablation.
-    assert ByteLatentTransformer(ngrams=())(x, FixedPatcher(2))[0].shape == (1, 8, 256)
+    assert ByteLatentTransformer(ngrams=())(x[:, 1:]-4, FixedPatcher(2))[0].shape == (1, 8, 256)
 
 
 @pytest.mark.parametrize("starts,size", [([1], 3), ([0, 0], 3), ([0, 4], 3), ([0, 2, 1], 3)])
@@ -307,12 +306,12 @@ def test_patch_masks_independent():
 
 
 @pytest.mark.parametrize("n", [1, 3, 5, 8])
-@pytest.mark.parametrize("function", [0, 1])
+@pytest.mark.parametrize("function", [0, 1, 2])
 def test_hash_scalar_reference(n, function):
     from minblt.blt import byte_hash
     # Internal symbols use Meta's offset=4 and BOS=1; zero left padding is BOE.
     values = [1, 4, 259, 5, 42, 190, 255, 128]
-    prime = [1000000007, 5915587277][function]
+    prime = [1000000007, 5915587277, 1500450271][function]
     expected = []
     for t in range(len(values)):
         gram = ([0]*(n-1) + values[:t+1])[-n:]
@@ -342,3 +341,145 @@ def test_multiple_patch_queries_and_layers(queries):
         for name, parameter in module.named_parameters():
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
             assert parameter.grad.abs().sum() > 0, name
+
+
+@pytest.mark.parametrize("text", ["", "ASCII", "caf\u00e9", "\u4f60\u597d", "\U0001f30d"])
+def test_unicode_and_binary_api(text):
+    assert decode(encode(text)) == text
+    raw = bytes(range(256))
+    assert small_model().generate(raw, FixedPatcher(), max_new_bytes=0) == raw
+
+
+def test_rmsnorm_swiglu_and_attention():
+    from minblt.base import Attention, FeedForward, RMSNorm
+
+    torch.manual_seed(31)
+    x = torch.randn(1, 3, 16)
+    norm = RMSNorm(16)
+    expected = x / (x.square().mean(-1, keepdim=True)+1e-5).sqrt()
+    torch.testing.assert_close(norm(x), expected)
+    ff = FeedForward(16)
+    gate = x @ ff.gate.weight.T
+    expected = ((gate*gate.sigmoid()) * (x @ ff.value.weight.T)) @ ff.out.weight.T
+    torch.testing.assert_close(ff(x), expected)
+    attention = Attention(16, heads=2)
+    allow = torch.tensor([[[True, False, False], [True, True, False], [False, False, False]]])
+    q = (x @ attention.q.weight.T).reshape(1, 3, 2, 8).transpose(1, 2)
+    k = (x @ attention.k.weight.T).reshape(1, 3, 2, 8).transpose(1, 2)
+    v = (x @ attention.v.weight.T).reshape(1, 3, 2, 8).transpose(1, 2)
+    expected = torch.zeros_like(q)
+    for h in range(2):
+        for t in range(2):
+            scores = q[0, h, t] @ k[0, h, :t+1].T / math.sqrt(8)
+            expected[0, h, t] = scores.softmax(-1) @ v[0, h, :t+1]
+    expected = expected.transpose(1, 2).reshape(1, 3, 16) @ attention.out.weight.T
+    torch.testing.assert_close(attention(x, x, allow), expected)
+    assert torch.isfinite(attention(x, x, allow)).all()
+
+
+def test_global_patch_causality():
+    model = small_model()
+    patches = torch.randn(1, 5, 32)
+    original = model.global_model(patches)
+    changed = patches.clone()
+    changed[:, 3:] += torch.randn_like(changed[:, 3:])*10
+    torch.testing.assert_close(original[:, :3], model.global_model(changed)[:, :3])
+    assert (original[:, 3:] - model.global_model(changed)[:, 3:]).abs().max() > 1e-4
+
+
+@pytest.mark.parametrize("window", [None, 1, 2])
+def test_decoder_only_uses_aligned_completed_patches(window):
+    from minblt.patch import decoder_patch_ids
+
+    model = ByteLatentTransformer(local_dim=16, global_dim=32, cross_window=window,
+                                 ngrams=()).eval()
+    patches = Patches.build([0, 3, 5], 7).with_bos()
+    h = torch.randn(1, 8, 16)
+    g = torch.randn(1, 4, 32)
+    original = model.decoder(h, g, patches)
+    ids = decoder_patch_ids(patches)
+    # Change each global patch, keeping byte states fixed. Query target t may
+    # see key j only if j <= decoder_patch_id[t], independent of byte states.
+    for j in range(1, 4):
+        changed = g.clone()
+        changed[:, j] += torch.randn_like(changed[:, j])*10
+        future_free = torch.tensor([q < j for q in ids])
+        torch.testing.assert_close(original[:, future_free], model.decoder(h, changed, patches)[:, future_free])
+    # Independent equality-mask check: default window sees K keys of exactly one patch.
+    from minblt.patch import patch_mask
+    keys = torch.arange(4).repeat_interleave(2)
+    mask = patch_mask(torch.tensor(ids), keys, window)[0]
+    for t, q in enumerate(ids):
+        expected = [j//2 == q if window is None else 0 <= q-j//2 < window for j in range(8)]
+        assert mask[t].tolist() == expected
+
+
+def test_parallel_entropy_and_boundaries_away_from_ties():
+    torch.manual_seed(41)
+    entropy_model = TinyEntropyModel(dim=16)
+    raw = b"A stream of bytes, 123."
+    canonical = entropy_model.entropies(raw, mode="prefix")
+    parallel = entropy_model.entropies(raw, mode="parallel")
+    torch.testing.assert_close(canonical, parallel, atol=2e-6, rtol=0)
+    for policy in ["global", "relative"]:
+        scores = canonical[1:] if policy == "global" else canonical[1:]-canonical[:-1]
+        ordered = sorted(float(s) for s in scores)
+        # Choose a threshold strictly inside the largest score gap, not on a tie.
+        a, b = max(zip(ordered, ordered[1:]), key=lambda pair: pair[1]-pair[0])
+        assert b-a > 1e-5
+        patcher = EntropyPatcher(entropy_model, (a+b)/2, policy=policy)
+        assert patcher.from_entropies(canonical) == patcher.from_entropies(parallel)
+
+
+def test_frozen_entropy_and_blt_loss_decrease():
+    torch.manual_seed(2)
+    entropy_model = TinyEntropyModel(dim=16)
+    patcher = EntropyPatcher(entropy_model, 5.4, max_patch_length=3)
+    model = small_model().train()
+    x = torch.tensor([list(b"abababababab")])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    initial = model(x, patcher)[1].item()
+    for _ in range(10):
+        optimizer.zero_grad()
+        _, loss = model(x, patcher)
+        loss.backward()
+        optimizer.step()
+    assert loss.item() < initial
+    assert all(p.grad is None and not p.requires_grad for p in entropy_model.parameters())
+
+
+def test_reference_boundaries_scalar_oracle():
+    # Independent transcription of Meta's threshold path, translated from
+    # next-token scores on [BOS]+payload to payload-position entropies H[t].
+    arrays = [[1.], [2.]*6, [1., 1.2, 3., 2., 3.5], [0.]*8]
+    for h in arrays:
+        for policy in ["global", "relative"]:
+            for threshold in [0., 1., 2.5, 99.]:
+                internal_starts = [0, 1]
+                for t in range(1, len(h)):
+                    if policy == "relative":
+                        boundary = t == 1 or h[t]-h[t-1] > threshold
+                    else:
+                        boundary = h[t] > threshold
+                    if boundary:
+                        internal_starts.append(t+1)
+                patches = EntropyPatcher(None, threshold, policy=policy).from_entropies(h)
+                assert patches.with_bos().starts == internal_starts
+                assert min(patches.lengths) > 0 and sum(patches.lengths) == len(h)
+
+
+def test_real_corpus_two_stage_training_and_reload(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    shutil.copytree(root / "minblt", tmp_path / "minblt", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copyfile(root / "train.py", tmp_path / "train.py")
+    (tmp_path / "tests").mkdir()
+    shutil.copyfile(root / "tests/taylorswift.txt", tmp_path / "tests/taylorswift.txt")
+    command = [sys.executable, "train.py", "--device", "cpu", "--steps-entropy", "2",
+               "--steps-blt", "2", "--seq-len", "16", "--batch-size", "1", "--eval-bytes", "32"]
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    model, patcher, metadata = ByteLatentTransformer.load(tmp_path / "models/blt.pt")
+    assert isinstance(patcher, EntropyPatcher)
+    assert metadata["bytes"] == 185768 and metadata["train_bytes"] == int(0.9*185768)
+    assert metadata["evaluated_bytes"] == 32
+    assert len(model.generate(b"Better", patcher, 8)) == 14

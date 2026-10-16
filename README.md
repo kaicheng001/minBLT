@@ -1,149 +1,159 @@
-# minblt
+# minBLT
 
-A small, readable PyTorch Byte Latent Transformer for learning how BLT works.
-It models UTF-8 bytes directly, with 256 output classes and no tokenizer download.
-Patches are contextual groups of bytes of arbitrary length, not entries in a BPE
-vocabulary. This is an educational model, not a reproduction of published scores.
+A minimal PyTorch reimplementation of the Byte Latent Transformer (BLT).
+The small files, direct interfaces and training example follow Andrej Karpathy's
+[minbpe](https://github.com/karpathy/minbpe), including its exact
+[Taylor Swift corpus](tests/taylorswift.txt). The adaptation credits take their cue
+from [minbpe-pytorch](https://github.com/kuprel/minbpe-pytorch).
 
-```text
-raw bytes -> local causal encoder -> patch cross-attention pooling
-                                             |
-                              larger causal global Transformer
-                                             |
-shifted encoder states -> decoder cross-attention -> local causal decoder
-                                             |
-                                  next-byte logits (256 classes)
-```
+The algorithms follow the [BLT paper](https://aclanthology.org/2025.acl-long.453/)
+and [Meta's implementation](https://github.com/facebookresearch/blt). This project
+is unofficial; it makes no claim to reproduce paper-scale training or weights.
+BPE learns a fixed vocabulary of merges. BLT instead models raw bytes and forms
+contextual, variable-length patches. A patch is not a vocabulary token.
 
-## Causal indexing
+1. [base.py](minblt/base.py): byte conventions, RMSNorm, RoPE, SwiGLU and attention.
+2. [patch.py](minblt/patch.py): fixed/entropy boundaries, masks and calibration.
+3. [entropy.py](minblt/entropy.py): a separately trained causal byte entropy model.
+4. [blt.py](minblt/blt.py): encoder, patch Transformer, decoder and save/load.
+5. [train.py](train.py): train both models, reload a checkpoint, or generate bytes.
 
-`model(x, patcher)` returns logit `t` for target `x[t]`, not `x[t+1]`.
-The decoder receives a learned BOS at position zero and encoder state `t-1`
-at position `t`. An encoder state includes its own byte and preceding bytes only.
-Patch `j` pools all its bytes, so its global state is visible only to bytes in
-patches `k > j`. A learned initial context handles the first patch. Decoder
-cross-attention can use all completed patches; it always masks the unfinished
-current patch, even when that patch has already been pooled in teacher forcing.
-The last partial patch is similarly unavailable until a new patch starts.
+## quick start
 
-Generation recomputes the model on the prefix plus a dummy target byte. The
-dummy's value cannot influence its logit or boundary. This intentionally slow
-method uses exactly the training masks and supports empty prompts.
-Entropy scoring also evaluates each canonical prefix separately: this avoids
-float32 rounding differences between full-sequence and prefix-shaped attention
-flipping a hard boundary when an entropy score equals the threshold.
-
-Inputs are `[batch, time]` long tensors with bytes `0..255`; optional **right**
-padding uses `256`. Each example must contain at least one byte. Examples are
-sliced before attention and pooling. Padding never contributes to context or
-loss. The internal BOS is not an output class. Loss is mean valid-byte NLL;
-`BPB = total NLL / (valid byte count * ln(2))`.
-
-## Patching
-
-The separately trained `TinyEntropyModel` predicts the next byte from the prefix.
-For target position `t`, `H[t] = -sum(p * log(p))` uses only `x[:t]` and is
-measured in nats. The frozen entropy model is not trained through the hard
-boundary decisions.
-
-- Global: start a patch if `H[t] > threshold`.
-- Relative: start if `H[t] - H[t-1] > threshold`.
-- Both start at zero; equality does not trigger a boundary. Empty inputs have
-  no patches. An optional length cap starts a new patch causally. Relative
-  patching measures increases, so sustained high entropy need not split.
-- Global calibration uses a training window to approximate a desired average
-  patch size, reporting the achieved value. Ties, the length cap, and short
-  windows can prevent an exact target. The threshold then stays fixed for
-  validation and generation. There is no sequence-wide top-k boundary selection.
-
-`FixedPatcher(4)` is a sanity baseline. Patches may split UTF-8 characters;
-keep raw bytes for lossless storage and decode with `errors="replace"` for display.
-Random training windows reset BOS and patch state. Held-out BPB uses the same
-reset convention per window and is not a document-level benchmark measurement.
-
-## Quick start
-
-Python 3.11+ and CPU PyTorch are sufficient. From the repository root:
+Use Python 3.11+ with CPU PyTorch. From the repository root:
 
 ```bash
-python -m venv .venv
-# Activate .venv: Windows PowerShell: .venv\Scripts\Activate.ps1
-# Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-pytest -q
-python train.py --stage all --data tests/input.txt --device cpu --steps-entropy 10 --steps-blt 10 --seq-len 64 --batch-size 2
-python demo.py --device cpu --prompt "Better than BPE" --max-new-bytes 32
+python -m pip install -r requirements.txt
+python train.py
+python train.py --generate --prompt "Better than BPE" --max-new-bytes 32
 ```
 
-The first command trains both models and writes ignored `models/entropy.pt` and
-`models/blt.pt`. The latter contains configs, state dictionaries, the frozen
-entropy model and the calibrated threshold, so demo needs only that checkpoint.
-Checkpoints use `torch.load(..., weights_only=True)`, not pickled model objects.
-The short original corpus in `tests/input.txt` needs no download. Ten steps check
-the computation; they do not produce fluent text.
+The default runs 20 steps per stage. For a shorter CPU check, use
+`python train.py --steps-entropy 10 --steps-blt 10 --device cpu`.
 
-Train stages separately with `--stage entropy` and `--stage blt`. Use
-`--patch-mode fixed --patch-size 4` for the baseline, or
-`--policy relative --threshold 0.01` for entropy increases. `--threshold` overrides
-global calibration; otherwise `--target-patch-size 4` controls its target.
-`--max-patch-length 16` is the default safety cap. `--seed` controls initialization
-and sampling. External corpora are accepted with `--data path/to/text.txt`.
+The library also accepts ordinary byte tensors (this example is untrained):
 
 ```python
 import torch
 from minblt import ByteLatentTransformer, FixedPatcher
 model, patcher = ByteLatentTransformer(), FixedPatcher(4)
-x = torch.tensor([list("A café!".encode("utf-8"))])
-logits, loss = model(x, patcher)
+raw = "Hello, café!".encode("utf-8")
+logits, loss = model(torch.tensor([list(raw)]), patcher)
 ```
 
-To use the trained entropy patcher and inspect actual model-based boundaries:
+Reload the model and its frozen patcher from the authoritative `.pt` file:
 
 ```python
-from demo import load_checkpoint
-from minblt import visualize_patches
-model, patcher = load_checkpoint("models/blt.pt")
-raw = b"Better than BPE!"
+from minblt import ByteLatentTransformer, visualize_patches
+model, patcher, metadata = ByteLatentTransformer.load("models/blt.pt")
+raw = b"Better than BPE"
 print(visualize_patches(raw, patcher(raw)))
-output = model.generate(raw, patcher, max_new_bytes=32, top_k=40)
-print(repr(output))  # Exact bytes; decode only for human-readable display.
+output = model.generate(raw, patcher, max_new_bytes=32)
+print(repr(output))  # Keep bytes; UTF-8 replacement decoding is only for display.
+model.save("models/copy.pt", patcher, metadata)
 ```
 
-## Reading the code
+## how it works
 
-- `minblt/base.py`: byte conventions, RMSNorm, explicit masked attention and blocks.
-- `minblt/patch.py`: patch metadata, fixed/global/relative boundaries and calibration.
-- `minblt/entropy.py`: independently trained causal next-byte entropy Transformer.
-- `minblt/model.py`: hash embeddings, local encoder, global model, decoder and sampling.
-- `minblt/__init__.py`: the small public interface.
-- `train.py`: AdamW training, held-out byte-weighted BPB and checkpoint saving.
-- `demo.py`: checkpoint reloading, byte generation and patch statistics.
-- `tests/test_minblt.py`: CPU causality, gradients, alignment and round-trip checks.
+```text
+bytes -> local encoder + K patch queries -> global patch Transformer
+                                               |
+shifted encoder states -> patch cross-attention -> local decoder -> 256 logits
+```
 
-The defaults use 32-wide local models and a 64-wide, two-layer global model.
-Sinusoidal positions replace RoPE. One encoder pooling attention and one decoder
-cross-attention replace the paper's repeated blocks and patch head splitting.
-Hash embeddings use one length (3) and 256 buckets by default, with deliberate
-collisions; set `ngrams=()` to disable them or pass several lengths. Their
-polynomial hashes see only current and preceding bytes. The decoder uses all
-past patch states rather than the paper's split-state arrangement.
+`B x T` targets become `B x (P+1) x K x D_local` queries, including singleton BOS.
+Concatenate K queries for each global step, then split global outputs into K
+decoder keys/values. Cross-attention follows each encoder block and precedes each
+decoder block. Logit `t` predicts `x[t]` from encoder state `([BOS]+x)[t]` and the
+preceding completed patch. The default cross mask selects that patch exactly;
+`cross_window=2` includes its predecessor. [lecture.md](lecture.md) derives the lag.
 
-There is no KV cache, fused attention, distributed training, packed document
-masking, large-scale data pipeline or pretrained weight compatibility. The model
-recomputes unfinished patches during generation and uses simple per-example
-loops. These reductions favor inspectable causal mathematics over speed.
+Frozen next-byte entropy `H[t] = -sum(p * log(p))` uses only `x[:t]`, in nats.
+Split on `H[t] > threshold`, or on `H[t]-H[t-1] > threshold` in relative mode,
+which also forces payload byte 1 as in Meta's helper. Length caps are causal;
+equality does not split. Calibration fits a fixed global threshold on a training
+window and reports achieved average length. `mode="prefix"` is canonical;
+`mode="parallel"` has tested `2e-6`-nat CPU tolerance, agreeing away from ties.
 
-## References and licensing
+Generation recomputes prefixes with a causally hidden dummy target. External bytes
+are `0..255`, right padding is `256`; internal IDs are Meta's BOE=0, BOS=1, EOS=2,
+reserved=3, byte+4. Padding is sliced before attention/hash; the head predicts
+only bytes. UTF-8 characters may span patches.
 
-Algorithmic references are the [BLT paper](https://arxiv.org/abs/2412.09871)
-(Sections 2 and 3, Figures 2 and 5) and [Meta's official BLT
-implementation](https://github.com/facebookresearch/blt), including its patcher,
-local models, latent Transformer and decoder alignment. The short files and
-direct interfaces are inspired by [Karpathy's minbpe](https://github.com/karpathy/minbpe).
-This implementation was written from scratch; substantial source blocks were not
-copied from either repository. It is unofficial and cannot load official weights.
+## training
 
-The official Meta code is CC-BY-NC-4.0; minbpe is MIT. Those licenses belong to
-their respective projects and are not relicensed here. No license grant for the
-new code is asserted: the repository owner should choose one before redistribution.
-The included workshop corpus is original text written for this repository.
+The unmodified minbpe corpus has 185,768 bytes, SHA-256
+`c2e39cb822d4ae0caac22152cefc306d466e31217a9c5524e493ad2b76792f57`.
+The first 90% trains both models; the final 10% is held out. Evaluate its first
+1,024 bytes (`--eval-bytes`) with BOS reset per window.
+BPB is `sum(NLL) / (valid byte count * ln(2))`.
+
+`--stage entropy` / `--stage blt` run separately; `--data` accepts another file.
+Use `--patch-mode fixed --patch-size 4` or `--policy relative --threshold 0.01`
+for comparisons. `--threshold` overrides calibration; `--target-patch-size` sets
+its target. Fixed patching shares the BLT class, so a separate `basic.py` adds no algorithm.
+AdamW trains on seeded windows; ignored `models/` stores weights,
+architecture, patch settings and dataset metadata. Twenty steps do not imply fluency.
+
+The constructor exposes depths, K, windows, n-gram lengths and table sizes.
+Defaults use lengths 3..8 and one polynomial hash; `ngrams=()` disables hashes.
+Hashes match signed-int64 overflow, zero left padding and final table modulo.
+
+## tests
+
+```bash
+pytest -v .
+```
+
+Tests check reference mathematics, causality, gradients, reload and real training.
+
+## exercise
+
+Build the components in order with [exercise.md](exercise.md).
+
+## lecture
+
+Trace byte probabilities through the model in [lecture.md](lecture.md).
+
+## limitations
+
+| Component | Reference behavior retained |
+| --- | --- |
+| Entropy and patching | Trained frozen byte LM, global/relative rules, initial singleton, causal cap |
+| Local encoder | Configurable local RoPE blocks, projected K queries, repeated patch cross-attention |
+| Global model | Wider causal RMSNorm/RoPE/SwiGLU stack over concatenated patch queries |
+| Decoder | Shifted reference patch IDs, K-way split conditions, patch/history mask, repeated cross-attention |
+| Byte embeddings | Offset symbols, selectable causal polynomial n-grams with signed overflow |
+
+Paper equations use one cross-attention residual and normalize hash sums; the
+pinned Meta code adds a second residual and leaves those sums unscaled. This
+implementation follows the paper for those two choices. The fixed baseline uses
+the same singleton BOS alignment as dynamic mode rather than static BOE padding.
+Widths, hash tables and FFN rounding multiples are small; initialization uses
+PyTorch defaults. KV caching, fused/distributed execution, document packing,
+serving and official checkpoint loading are omitted. Prefix recomputation is slow.
+
+## references / credits
+
+Inspected revisions: [minbpe `1acefe8`](https://github.com/karpathy/minbpe/tree/1acefe89412b20245db5a22d2a02001e547dc602),
+[minbpe-pytorch `6917201`](https://github.com/kuprel/minbpe-pytorch/tree/6917201135258f37eb6e4925f8fef6bb2c79244d),
+[Meta BLT `9774ed4`](https://github.com/facebookresearch/blt/tree/9774ed4fcc78313f9f218295f3d7e4decdadf2ae).
+The [archival paper](https://aclanthology.org/2025.acl-long.453/) (Sections 2–3,
+Figures 2 and 4, Appendices E–F) resolves algorithm definitions; the
+[arXiv version](https://arxiv.org/abs/2412.09871) has different figure numbering.
+The Python code is independently written, with no vendored upstream modules.
+The projects and authors named here do not endorse MiniBLT.
+
+## License
+
+Upstream minbpe and minbpe-pytorch software is MIT; Meta BLT code is
+[CC BY-NC 4.0](https://github.com/facebookresearch/blt/blob/9774ed4fcc78313f9f218295f3d7e4decdadf2ae/LICENSE).
+No software license for this new implementation is asserted; the repository owner
+must choose its terms.
+
+The corpus is separately attributed to [Wikipedia's Taylor Swift contributors](https://en.wikipedia.org/wiki/Taylor_Swift)
+([history](https://en.wikipedia.org/w/index.php?title=Taylor_Swift&action=history)),
+copied by minbpe on February 16, 2024 and redistributed here byte-for-byte under
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), as its preserved
+footer states. Its exact source is the [pinned minbpe data file](https://github.com/karpathy/minbpe/blob/1acefe89412b20245db5a22d2a02001e547dc602/tests/taylorswift.txt).
+The software's MIT notices do not relicense Wikipedia text.
