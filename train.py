@@ -1,10 +1,8 @@
 """Train an entropy model and BLT on minbpe's original example corpus."""
 
 import argparse
-import hashlib
 import math
 from pathlib import Path
-import random
 import time
 
 import torch
@@ -66,10 +64,9 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
-    random.seed(args.seed)
     device = torch.device(args.device)
     if args.generate:
-        model, patcher, _ = ByteLatentTransformer.load(args.checkpoint, device)
+        model, patcher = ByteLatentTransformer.load(args.checkpoint, device)
         prompt = args.prompt.encode("utf-8")
         output = model.generate(prompt, patcher, args.max_new_bytes, top_k=40)
         print("prompt: " + ascii(args.prompt))
@@ -78,45 +75,27 @@ def main():
         print(f"output length={len(output)}, new bytes={len(output)-len(prompt)}")
         print(visualize_patches(output, patcher(output)))
         return
-    if min(args.steps_entropy, args.steps_blt) < 0 or min(args.seq_len, args.batch_size, args.eval_bytes) < 1:
-        parser.error("Step counts must be nonnegative; sequence, batch and evaluation sizes must be positive")
     if args.policy == "relative" and args.threshold is None and args.patch_mode == "entropy":
         parser.error("Relative patching requires an explicit --threshold in nats")
     raw = Path(args.data).read_bytes()
     split = int(0.9*len(raw))
-    if split < args.seq_len or split == len(raw):
-        parser.error("Data must provide a full training window and a held-out split")
-    metadata = dict(data=args.data, sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw),
-                    train_bytes=split, validation_bytes=len(raw)-split,
-                    evaluated_bytes=min(args.eval_bytes, len(raw)-split), seed=args.seed,
-                    seq_len=args.seq_len, batch_size=args.batch_size,
-                    steps_entropy=args.steps_entropy, steps_blt=args.steps_blt)
     data = torch.tensor(list(raw[:split]), dtype=torch.long, device=device)
     validation = torch.tensor(list(raw[split:split+args.eval_bytes]), dtype=torch.long, device=device)
     Path("models").mkdir(exist_ok=True)
     start = time.monotonic()
     print(f"Corpus: {args.data}, {len(raw)} bytes; chronological 90/10 split")
-    print("Small-model measurements; no paper-scale results are implied.")
     entropy_model = None
-    entropy_metadata = None
-    if args.stage in ("entropy", "all"):
+    if args.stage == "entropy" or (args.stage == "all" and args.patch_mode == "entropy"):
         print("Training the separate entropy model")
         entropy_model = EntropyModel().to(device)
         fit(entropy_model, data, validation, args.steps_entropy, args)
-        entropy_metadata = metadata.copy()
-        torch.save(dict(config=entropy_model.config, state_dict=entropy_model.state_dict(),
-                        metadata=metadata), "models/entropy.pt")
+        torch.save(dict(config=entropy_model.config, state_dict=entropy_model.state_dict()), "models/entropy.pt")
     if args.stage in ("blt", "all"):
         if args.patch_mode == "entropy":
             if entropy_model is None:
-                if not Path("models/entropy.pt").exists():
-                    parser.error("Train the entropy stage first, or use --stage all")
                 saved = torch.load("models/entropy.pt", map_location=device, weights_only=True)
-                if saved["metadata"]["sha256"] != metadata["sha256"]:
-                    parser.error("Entropy checkpoint was trained on a different corpus")
                 entropy_model = EntropyModel(**saved["config"]).to(device)
                 entropy_model.load_state_dict(saved["state_dict"])
-                entropy_metadata = saved["metadata"]
             patcher = EntropyPatcher(entropy_model, args.threshold if args.threshold is not None else 0,
                                      args.policy, args.max_patch_length)
             if args.threshold is None:
@@ -128,9 +107,7 @@ def main():
         print("Training BLT with " + args.patch_mode + " patches")
         model = ByteLatentTransformer().to(device)
         fit(model, data, validation, args.steps_blt, args, patcher)
-        if entropy_metadata is not None:
-            metadata["entropy_training"] = entropy_metadata
-        model.save(args.checkpoint, patcher, metadata)
+        model.save(args.checkpoint, patcher)
         print("Saved " + args.checkpoint)
     print(f"Training took {time.monotonic()-start:.2f} seconds")
 

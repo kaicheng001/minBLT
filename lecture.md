@@ -3,8 +3,7 @@
 A byte language model assigns `p(x) = product_t p(x[t] | x[:t])`. The alphabet
 has 256 symbols even when text contains characters represented by several UTF-8
 bytes. BLT changes where most computation happens; it keeps this likelihood.
-The [archival BLT paper](https://aclanthology.org/2025.acl-long.453/) describes
-the architecture, and the [README](README.md) records the inspected code revision.
+The [BLT paper](https://aclanthology.org/2025.acl-long.453/) describes the architecture.
 
 ## uncertainty chooses boundaries
 
@@ -34,7 +33,9 @@ cross-attention uses no positional rotation. See [base.py](minblt/base.py).
 
 After the first encoder block, each patch mean is projected into K distinct
 queries. Queries attend only to that patch's byte states, with pre-RMSNorm and a
-residual. Subsequent encoder layers refine the same queries. Concatenating K
+residual. As in Meta's local models, the caller adds the query state once more:
+`q_next = 2*q + attention(norm(q), norm(bytes))`.
+Subsequent encoder layers refine the same queries. Concatenating K
 query states and projecting them produces one wider global input per patch.
 The global causal Transformer can therefore spend more capacity at fewer
 positions than a Transformer of the same width running on every byte.
@@ -54,15 +55,15 @@ bytes have been observed.
 
 The decoder projects each global state into K keys/values. Its default mask
 selects exactly the aligned global patch; a finite history window can include
-earlier patches. Every decoder layer applies cross-attention before local causal
-self-attention. The final RMSNorm and 256-way head predict individual bytes.
+earlier patches. Every decoder layer uses the same cross-attention residual rule
+before local causal self-attention. The final RMSNorm and 256-way head predict bytes.
 
 ## train and sample the same distribution
 
 [train.py](train.py) trains the entropy model, freezes it, and trains BLT on the
 same chronological training split. Mean NLL counts valid bytes only, and
 `BPB = total NLL / (valid bytes * ln(2))`. The held-out subset resets BOS per
-window; it is a small reproducible measurement, not a paper benchmark.
+window.
 
 Generation runs the same model on a prefix plus an arbitrary dummy target,
 samples its final 256-way distribution, and appends that raw byte. Causal masks

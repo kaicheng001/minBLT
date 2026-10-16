@@ -1,4 +1,4 @@
-"""Shared byte conventions and small, explicit Transformer building blocks."""
+"""Byte helpers and the Transformer blocks shared by both models."""
 
 import math
 
@@ -9,7 +9,7 @@ from torch.nn import functional as F
 # Public tensors hold bytes 0..255 and right padding 256. Internally use Meta's
 # offset-byte arrangement: BOE=0, BOS=1, EOS=2, reserved=3, bytes=4..259.
 PAD = 256
-BOE, BOS, EOS, OFFSET = 0, 1, 2, 4
+BOS, OFFSET = 1, 4
 
 
 def encode(text):
@@ -69,7 +69,7 @@ def rope(x, theta=10000.0):
 class Attention(nn.Module):
     """[B,Q,D] queries, [B,K,C] context, [B,Q,K] Boolean ALLOW mask."""
 
-    def __init__(self, dim, heads=4, context_dim=None, rotary=False, rope_theta=10000.0):
+    def __init__(self, dim, heads=4, rotary=False, rope_theta=10000.0):
         super().__init__()
         if dim % heads:
             raise ValueError("Attention width must be divisible by head count")
@@ -77,10 +77,9 @@ class Attention(nn.Module):
         self.rotary, self.rope_theta = rotary, rope_theta
         if rotary and (dim // heads) % 2:
             raise ValueError("RoPE requires an even head dimension")
-        context_dim = context_dim or dim
         self.q = nn.Linear(dim, dim, bias=False)
-        self.k = nn.Linear(context_dim, dim, bias=False)
-        self.v = nn.Linear(context_dim, dim, bias=False)
+        self.k = nn.Linear(dim, dim, bias=False)
+        self.v = nn.Linear(dim, dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x, context, allow):
@@ -90,9 +89,7 @@ class Attention(nn.Module):
         query, key, value = split(self.q(x)), split(self.k(context)), split(self.v(context))
         if self.rotary:
             query, key = rope(query, self.rope_theta), rope(key, self.rope_theta)
-        # SDPA Boolean True means allow. Give empty rows a temporary finite
-        # softmax, then zero them: older CPU SDPA versions can return NaNs for
-        # all-masked rows. This also keeps padding-query behavior explicit.
+        # True means allow. Zero empty rows without an all-masked softmax.
         active = allow.any(-1, keepdim=True)
         safe_allow = allow | ~active
         values = F.scaled_dot_product_attention(query, key, value, attn_mask=safe_allow[:, None])
@@ -126,7 +123,7 @@ class FeedForward(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """Normalized patch cross-attention, without RoPE; one residual per paper."""
+    """Meta's normalized cross-attention block, including its inner residual."""
 
     def __init__(self, dim, heads=4):
         super().__init__()

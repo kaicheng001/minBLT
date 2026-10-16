@@ -1,7 +1,5 @@
 """Byte Latent Transformer: local encoder, causal patch model, local decoder."""
 
-from pathlib import Path
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -14,18 +12,9 @@ HASH_PRIMES = (1000000007, 5915587277, 1500450271)
 
 
 def byte_hash(tokens, length, buckets, function=0):
-    """Internal offset symbols -> table IDs, including zero-padded leading grams.
-
-    Match the reference signed-int64 wraparound BEFORE the final table modulo.
-    Reducing modulo buckets at every multiply would be a different hash.
-    """
-    if length < 1 or buckets < 1 or not 0 <= function < len(HASH_PRIMES):
-        raise ValueError("Invalid n-gram length, bucket count or hash function")
-    coefficients = []
-    for i in range(length):
-        value = pow(HASH_PRIMES[function], i, 1 << 64)
-        coefficients.append(value if value < 1 << 63 else value-(1 << 64))
-    powers = tokens.new_tensor(coefficients)
+    """Hash left-padded n-grams of internal byte IDs, as in Meta's byte hash."""
+    # int64 powers and sums wrap before the final table modulo.
+    powers = tokens.new_tensor(HASH_PRIMES[function]) ** torch.arange(length, device=tokens.device)
     grams = F.pad(tokens, (length-1, 0)).unfold(1, length, 1)
     return (grams*powers).sum(-1).remainder(buckets)
 
@@ -33,9 +22,7 @@ def byte_hash(tokens, length, buckets, function=0):
 class HashEmbedding(nn.Module):
     def __init__(self, dim, lengths, buckets, functions=1):
         super().__init__()
-        if buckets < 1 or not 1 <= functions <= len(HASH_PRIMES) or any(n < 1 for n in lengths):
-            raise ValueError("Invalid hash settings")
-        self.lengths, self.buckets, self.functions = tuple(lengths), buckets, functions
+        self.lengths, self.buckets = tuple(lengths), buckets
         self.tables = nn.ModuleList([nn.Embedding(buckets, dim) for _ in range(functions) for _ in lengths])
 
     def forward(self, tokens):
@@ -59,7 +46,7 @@ class LocalEncoder(nn.Module):
 
     def forward(self, tokens, patches):
         """Unpadded input: [1,T,D] byte states and [1,P,K,D] patch queries."""
-        h = (self.embedding(tokens) + self.hash(tokens)) / (1+len(self.hash.tables))
+        h = self.embedding(tokens) + self.hash(tokens)
         allow = causal_mask(torch.ones_like(tokens, dtype=torch.bool), self.window)
         ids = torch.tensor(patches.ids, device=tokens.device)
         query_ids = torch.arange(len(patches.starts), device=tokens.device).repeat_interleave(self.k)
@@ -68,12 +55,12 @@ class LocalEncoder(nn.Module):
         for block, cross in zip(self.blocks, self.cross_attention):
             h = block(h, allow)
             if queries is None:
-                # Meta's pooling-initialized path: project each first-layer patch
-                # mean into K distinct queries; preserve and refine them at depth.
+                # A patch mean initializes K distinct queries at the first layer.
                 pooled = torch.stack([h[0, s:s+n].mean(0)
                                        for s, n in zip(patches.starts, patches.lengths)])[None]
                 queries = self.query_projection(pooled).reshape(1, -1, h.shape[-1])
-            queries = cross(queries, h, membership)
+            # The reference local model adds a residual outside CrossAttention too.
+            queries = queries + cross(queries, h, membership)
         return h, queries.reshape(1, len(patches.starts), self.k, h.shape[-1])
 
 
@@ -81,14 +68,13 @@ class GlobalTransformer(nn.Module):
     def __init__(self, dim, layers, heads, theta):
         super().__init__()
         self.blocks = nn.ModuleList([Block(dim, heads, theta) for _ in range(layers)])
-        self.norm = RMSNorm(dim)
 
     def forward(self, patches):
         valid = torch.ones(patches.shape[:2], device=patches.device, dtype=torch.bool)
         allow = causal_mask(valid)
         for block in self.blocks:
             patches = block(patches, allow)
-        return self.norm(patches)
+        return patches
 
 
 class LocalDecoder(nn.Module):
@@ -112,7 +98,7 @@ class LocalDecoder(nn.Module):
         cross_mask = patch_mask(query_ids, key_ids, self.cross_window)
         local_mask = causal_mask(torch.ones(h.shape[:2], dtype=torch.bool, device=h.device), self.window)
         for cross, block in zip(self.cross_attention, self.blocks):
-            h = cross(h, context, cross_mask)
+            h = h + cross(h, context, cross_mask)
             h = block(h, local_mask)
         return self.head(self.norm(h))
 
@@ -123,10 +109,6 @@ class ByteLatentTransformer(nn.Module):
                  cross_window=None, ngrams=(3, 4, 5, 6, 7, 8), hash_buckets=256,
                  hash_functions=1, rope_theta=10000.0):
         super().__init__()
-        if min(local_dim, global_dim, encoder_layers, global_layers, decoder_layers, heads, cross_attn_k) < 1:
-            raise ValueError("Model widths, depths, heads and query count must be positive")
-        if (window is not None and window < 1) or (cross_window is not None and cross_window < 1):
-            raise ValueError("Attention windows must be positive")
         self.config = dict(local_dim=local_dim, global_dim=global_dim, encoder_layers=encoder_layers,
                            global_layers=global_layers, decoder_layers=decoder_layers, heads=heads,
                            cross_attn_k=cross_attn_k, window=window, cross_window=cross_window,
@@ -139,13 +121,10 @@ class ByteLatentTransformer(nn.Module):
                                     cross_attn_k, cross_window, rope_theta)
 
     def forward(self, byte_batch, patcher):
-        """Raw [B,T] targets -> [B,T,256] logits and valid-byte mean NLL.
-
-        Process examples separately so padding never enters any attention or hash.
-        The BOS patch supplies the first condition without any future content.
-        """
+        """[B,T] bytes -> [B,T,256] logits and mean next-byte loss."""
         valid = validate_bytes(byte_batch)
         outputs = []
+        # Slice each example so padding cannot enter attention, pooling or hashes.
         for row, mask in zip(byte_batch, valid):
             n = int(mask.sum())
             raw = row[:n]
@@ -161,8 +140,6 @@ class ByteLatentTransformer(nn.Module):
 
     @torch.no_grad()
     def next_logits(self, prefix, patcher, placeholder=0):
-        if not 0 <= placeholder <= 255:
-            raise ValueError("Placeholder must be an ordinary byte")
         x = torch.tensor([list(prefix)+[placeholder]], dtype=torch.long,
                          device=next(self.parameters()).device)
         return self(x, patcher)[0][0, -1]
@@ -184,24 +161,23 @@ class ByteLatentTransformer(nn.Module):
             self.train(was_training)
         return bytes(output)
 
-    def save(self, path, patcher, metadata=None):
-        config = dict(mode="fixed", patch_size=patcher.patch_size) if isinstance(patcher, FixedPatcher) else dict(
-            mode="entropy", threshold=patcher.threshold, policy=patcher.policy,
-            max_patch_length=patcher.max_patch_length, entropy_mode=patcher.entropy_mode)
+    def save(self, path, patcher):
         auxiliary = None
-        if isinstance(patcher, EntropyPatcher):
+        if isinstance(patcher, FixedPatcher):
+            config = dict(mode="fixed", patch_size=patcher.patch_size)
+        else:
+            config = dict(mode="entropy", threshold=patcher.threshold, policy=patcher.policy,
+                          max_patch_length=patcher.max_patch_length)
             auxiliary = dict(config=patcher.model.config, state_dict=patcher.model.state_dict())
-        torch.save(dict(version=2, config=self.config, state_dict=self.state_dict(),
-                        patcher=config, entropy=auxiliary, metadata=metadata or {}), Path(path))
+        torch.save(dict(config=self.config, state_dict=self.state_dict(),
+                        patcher=config, entropy=auxiliary), path)
 
     @classmethod
     def load(cls, path, device="cpu"):
-        """Return (eval model, frozen patcher, metadata) from an authoritative .pt file."""
+        """Load a model and its patcher from a .pt checkpoint."""
         from .entropy import EntropyModel
 
         saved = torch.load(path, map_location=device, weights_only=True)
-        if saved.get("version") != 2:
-            raise ValueError("Expected a MiniBLT v2 checkpoint; v1 weights are not compatible")
         model = cls(**saved["config"]).to(device).eval()
         model.load_state_dict(saved["state_dict"])
         config = saved["patcher"].copy()
@@ -212,4 +188,4 @@ class ByteLatentTransformer(nn.Module):
             entropy_model = EntropyModel(**auxiliary["config"]).to(device)
             entropy_model.load_state_dict(auxiliary["state_dict"])
             patcher = EntropyPatcher(entropy_model, **config)
-        return model, patcher, saved["metadata"]
+        return model, patcher

@@ -1,8 +1,6 @@
 """Incremental byte boundaries; patch IDs are positions, never vocabulary IDs."""
 
 from dataclasses import dataclass
-import math
-
 import torch
 
 
@@ -62,16 +60,10 @@ class FixedPatcher:
 
 
 class EntropyPatcher:
-    def __init__(self, model, threshold, policy="global", max_patch_length=None, entropy_mode="prefix"):
-        if policy not in ("global", "relative") or not math.isfinite(threshold):
-            raise ValueError("Expected a global or relative policy and finite threshold")
-        if max_patch_length is not None and max_patch_length < 1:
-            raise ValueError("Maximum patch length must be positive")
+    def __init__(self, model, threshold, policy="global", max_patch_length=None):
+        assert policy in ("global", "relative")
         self.model, self.threshold = model, float(threshold)
         self.policy, self.max_patch_length = policy, max_patch_length
-        if entropy_mode not in ("prefix", "parallel"):
-            raise ValueError("Entropy mode must be prefix or parallel")
-        self.entropy_mode = entropy_mode
         if model is not None:
             model.eval().requires_grad_(False)
             for parameter in model.parameters():
@@ -79,29 +71,23 @@ class EntropyPatcher:
 
     def from_entropies(self, entropies):
         h = [float(v) for v in entropies]
-        if not all(math.isfinite(v) for v in h):
-            raise ValueError("Entropies must be finite")
         starts = [0] if h else []
         for t in range(1, len(h)):
             score = h[t] if self.policy == "global" else h[t] - h[t-1]
             capped = self.max_patch_length is not None and t-starts[-1] >= self.max_patch_length
-            # Meta's monotonic helper forces the first surviving candidate.
-            # After removing the singleton BOS patch, this is payload byte 1.
+            # Meta's relative policy forces the first post-BOS candidate.
             initial_relative = self.policy == "relative" and t == 1
             if score > self.threshold or capped or initial_relative:
                 starts.append(t)
         return Patches.build(starts, len(h))
 
     def __call__(self, values):
-        if self.model is None:
-            raise ValueError("A trained entropy model is required for byte patching")
-        return self.from_entropies(self.model.entropies(values, mode=self.entropy_mode).tolist())
+        return self.from_entropies(self.model.entropies(values).tolist())
 
     def calibrate(self, values, target_patch_size=4):
-        """Fit a global threshold once; discrete ties may prevent an exact target."""
-        if self.policy != "global" or target_patch_size < 1 or not len(values):
-            raise ValueError("Calibration needs nonempty bytes, global policy and target >= 1")
-        h = self.model.entropies(values, mode=self.entropy_mode).tolist()
+        """Choose a global threshold for an approximate average patch length."""
+        assert self.policy == "global" and target_patch_size >= 1
+        h = self.model.entropies(values).tolist()
         low, high = min(h)-1e-6, max(h)+1e-6
         best = (float("inf"), self.threshold)
         for _ in range(40):

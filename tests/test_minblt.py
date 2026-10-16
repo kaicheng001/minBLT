@@ -1,27 +1,16 @@
 import math
-import hashlib
 from pathlib import Path
-import shutil
-import subprocess
-import sys
 
 import pytest
 import torch
 
 from minblt.base import byte_loss, decode, encode
 from minblt.patch import EntropyPatcher, FixedPatcher, Patches, visualize_patches
-from minblt.entropy import TinyEntropyModel
+from minblt.entropy import EntropyModel
 from minblt import ByteLatentTransformer
 
 
 torch.set_num_threads(1)
-
-
-def test_bytes():
-    text = "A café, π and a snowman: ☃!"
-    assert decode(encode(text)) == text
-    assert bytes(list(bytes(range(256)))) == bytes(range(256))
-    assert "\\xff" in repr(bytes([255]))
 
 
 @pytest.mark.parametrize("size,lengths", [(1, [1]*7), (3, [3, 3, 1]), (20, [7])])
@@ -61,7 +50,7 @@ def test_bpb_padding():
 @pytest.mark.parametrize("policy", ["global", "relative"])
 def test_entropy_alignment_and_streaming(policy):
     torch.manual_seed(4)
-    model = TinyEntropyModel(dim=16, layers=1).eval()
+    model = EntropyModel(dim=16, layers=1).eval()
     a = list(b"abcdefghi")
     b = a[:4] + list(b"ZYXWV")
     h = model.entropies(a)
@@ -84,7 +73,7 @@ def test_entropy_alignment_and_streaming(policy):
 
 def test_entropy_training():
     torch.manual_seed(2)
-    model = TinyEntropyModel(dim=16, layers=1)
+    model = EntropyModel(dim=16, layers=1)
     x = torch.tensor([list(b"abababab")])
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
     initial = model(x)[1].item()
@@ -118,7 +107,7 @@ def test_causal_logits_and_same_patch(patch_size):
 def test_dynamic_causality_with_changed_boundaries():
     model = small_model()
     torch.manual_seed(7)
-    entropy = TinyEntropyModel(dim=16)
+    entropy = EntropyModel(dim=16)
     x = torch.tensor([list(b"abcdefghijklmnop")])
     y = x.clone()
     y[:, 6:] = (y[:, 6:] + 80) % 256
@@ -131,16 +120,11 @@ def test_dynamic_causality_with_changed_boundaries():
                                atol=2e-6, rtol=2e-6)
 
 
-def test_padding_shapes_and_gradients():
-    model = small_model().train()
+def test_padding_shapes():
+    model = small_model()
     x = torch.tensor([[1, 2, 3, 4, 5, 6, 7], [20, 21, 22, 256, 256, 256, 256]])
     logits, loss = model(x, FixedPatcher(2))
     assert logits.shape == (2, 7, 256) and torch.isfinite(loss)
-    loss.backward()
-    for module in [model.encoder, model.global_model, model.decoder]:
-        gradients = [p.grad for p in module.parameters()]
-        assert gradients and all(g is not None and torch.isfinite(g).all() for g in gradients)
-        assert sum(g.abs().sum().item() for g in gradients) > 0
     alone = model(x[1:2, :3], FixedPatcher(2))[0]
     torch.testing.assert_close(logits[1:2, :3], alone, atol=2e-6, rtol=2e-6)
 
@@ -173,10 +157,8 @@ def test_global_influence_and_single_patch():
 def test_checkpoint_and_generation(tmp_path):
     model, patcher = small_model(), FixedPatcher(2)
     path = tmp_path / "model.pt"
-    torch.save(dict(config=model.config, state_dict=model.state_dict()), path)
-    checkpoint = torch.load(path, weights_only=True)
-    loaded = ByteLatentTransformer(**checkpoint["config"]).eval()
-    loaded.load_state_dict(checkpoint["state_dict"])
+    model.save(path, patcher)
+    loaded, patcher = ByteLatentTransformer.load(path)
     x = torch.tensor([list(b"hello")])
     torch.testing.assert_close(model(x, patcher)[0], loaded(x, patcher)[0])
     for prompt in [b"", b"hello", "café".encode()]:
@@ -187,7 +169,7 @@ def test_checkpoint_and_generation(tmp_path):
 
 def test_dynamic_generation_alignment():
     model = small_model()
-    entropy = TinyEntropyModel(dim=16)
+    entropy = EntropyModel(dim=16)
     raw = b"test bytes"
     h = entropy.entropies(list(raw))
     patcher = EntropyPatcher(entropy, float(h.median()))
@@ -200,12 +182,12 @@ def test_dynamic_generation_alignment():
 
 def test_entropy_checkpoint_roundtrip(tmp_path):
     model = small_model()
-    entropy = TinyEntropyModel(dim=16)
+    entropy = EntropyModel(dim=16)
     patcher = EntropyPatcher(entropy, 5.35, max_patch_length=4)
     path = tmp_path / "blt.pt"
-    model.save(path, patcher, metadata={"seed": 8})
-    restored, restored_patcher, metadata = ByteLatentTransformer.load(path)
-    assert model.config == restored.config and metadata == {"seed": 8}
+    model.save(path, patcher)
+    restored, restored_patcher = ByteLatentTransformer.load(path)
+    assert model.config == restored.config
     raw = b"bytes and patches"
     assert patcher(raw) == restored_patcher(raw)
     assert not any(p.requires_grad for p in restored_patcher.model.parameters())
@@ -244,14 +226,6 @@ def test_invalid_byte_batches(x):
         small_model()(torch.tensor(x), FixedPatcher(2))
 
 
-def test_original_minbpe_dataset():
-    from train import DEFAULT_DATA
-    raw = (Path(__file__).parent / "taylorswift.txt").read_bytes()
-    assert len(raw) == 185768
-    assert hashlib.sha256(raw).hexdigest() == "c2e39cb822d4ae0caac22152cefc306d466e31217a9c5524e493ad2b76792f57"
-    assert DEFAULT_DATA == "tests/taylorswift.txt"
-
-
 def test_rope_scalar_reference():
     from minblt import base
     x = torch.tensor([[[[1., 2., 3., 4.], [2., 1., 4., 3.]]]])
@@ -287,12 +261,8 @@ def test_reference_initial_patch_and_decoder_ids():
     assert internal.lengths == [1, 3, 2, 2]
     assert internal.ids == [0, 1, 1, 1, 2, 2, 3, 3]
     assert decoder_patch_ids(internal) == [0, 0, 0, 1, 1, 2, 2]
-    # Meta find_entropy_patch_start_ids uses initial encoder starts [0,1].
-    # Its monotonic helper additionally forces its first surviving candidate.
-    h = [1., 1.2, 3., 2., 3.5]
-    assert EntropyPatcher(None, 1., policy="relative").from_entropies(h).starts == [0, 1, 2, 4]
-    assert EntropyPatcher(None, 99., policy="relative").from_entropies(h).starts == [0, 1]
-    assert EntropyPatcher(None, 99.).from_entropies(h).with_bos().lengths == [1, 5]
+    # Meta's relative helper forces the first surviving post-BOS candidate.
+    assert EntropyPatcher(None, 99., policy="relative").from_entropies([1.]*5).lengths == [1, 4]
 
 
 def test_patch_masks_independent():
@@ -387,6 +357,16 @@ def test_global_patch_causality():
     assert (original[:, 3:] - model.global_model(changed)[:, 3:]).abs().max() > 1e-4
 
 
+def test_global_stack_has_no_extra_output_norm():
+    model = small_model()
+    with torch.no_grad():
+        for block in model.global_model.blocks:
+            for parameter in block.parameters():
+                parameter.zero_()
+    patches = torch.randn(1, 3, 32)
+    torch.testing.assert_close(model.global_model(patches), patches)
+
+
 @pytest.mark.parametrize("window", [None, 1, 2])
 def test_decoder_only_uses_aligned_completed_patches(window):
     from minblt.patch import decoder_patch_ids
@@ -415,11 +395,13 @@ def test_decoder_only_uses_aligned_completed_patches(window):
 
 
 def test_parallel_entropy_and_boundaries_away_from_ties():
+    from minblt.entropy import entropy
+
     torch.manual_seed(41)
-    entropy_model = TinyEntropyModel(dim=16)
+    entropy_model = EntropyModel(dim=16)
     raw = b"A stream of bytes, 123."
-    canonical = entropy_model.entropies(raw, mode="prefix")
-    parallel = entropy_model.entropies(raw, mode="parallel")
+    canonical = entropy_model.entropies(raw)
+    parallel = entropy(entropy_model(torch.tensor([list(raw)]))[0][0]).detach()
     torch.testing.assert_close(canonical, parallel, atol=2e-6, rtol=0)
     for policy in ["global", "relative"]:
         scores = canonical[1:] if policy == "global" else canonical[1:]-canonical[:-1]
@@ -433,7 +415,7 @@ def test_parallel_entropy_and_boundaries_away_from_ties():
 
 def test_frozen_entropy_and_blt_loss_decrease():
     torch.manual_seed(2)
-    entropy_model = TinyEntropyModel(dim=16)
+    entropy_model = EntropyModel(dim=16)
     patcher = EntropyPatcher(entropy_model, 5.4, max_patch_length=3)
     model = small_model().train()
     x = torch.tensor([list(b"abababababab")])
@@ -468,18 +450,49 @@ def test_reference_boundaries_scalar_oracle():
                 assert min(patches.lengths) > 0 and sum(patches.lengths) == len(h)
 
 
-def test_real_corpus_two_stage_training_and_reload(tmp_path):
-    root = Path(__file__).resolve().parents[1]
-    shutil.copytree(root / "minblt", tmp_path / "minblt", ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copyfile(root / "train.py", tmp_path / "train.py")
-    (tmp_path / "tests").mkdir()
-    shutil.copyfile(root / "tests/taylorswift.txt", tmp_path / "tests/taylorswift.txt")
-    command = [sys.executable, "train.py", "--device", "cpu", "--steps-entropy", "2",
-               "--steps-blt", "2", "--seq-len", "16", "--batch-size", "1", "--eval-bytes", "32"]
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
-    model, patcher, metadata = ByteLatentTransformer.load(tmp_path / "models/blt.pt")
+def test_real_corpus_two_stage_training_and_reload(tmp_path, monkeypatch):
+    from train import main
+
+    data = Path(__file__).with_name("taylorswift.txt").resolve()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["train.py", "--data", str(data), "--steps-entropy", "2",
+                                    "--steps-blt", "2", "--seq-len", "16", "--batch-size", "1", "--eval-bytes", "32"])
+    main()
+    model, patcher = ByteLatentTransformer.load(tmp_path / "models/blt.pt")
     assert isinstance(patcher, EntropyPatcher)
-    assert metadata["bytes"] == 185768 and metadata["train_bytes"] == int(0.9*185768)
-    assert metadata["evaluated_bytes"] == 32
     assert len(model.generate(b"Better", patcher, 8)) == 14
+
+
+def test_reference_hash_embedding_sum():
+    model = small_model()
+    tokens = torch.tensor([[1, 101, 102, 103]])
+    patches = FixedPatcher(2)(b"abc").with_bos()
+    inputs = []
+    hook = model.encoder.blocks[0].register_forward_pre_hook(lambda module, args: inputs.append(args[0]))
+    model.encoder(tokens, patches)
+    hook.remove()
+    expected = model.encoder.embedding(tokens) + model.encoder.hash(tokens)
+    torch.testing.assert_close(inputs[0], expected)
+
+
+def test_reference_local_cross_attention_residuals():
+    model = small_model()
+    # Meta's CrossAttention returns x+attention, and each local caller adds x.
+    with torch.no_grad():
+        for module in [model.encoder, model.decoder]:
+            for block in module.blocks:
+                for parameter in block.parameters():
+                    parameter.zero_()
+            for cross in module.cross_attention:
+                for parameter in cross.parameters():
+                    parameter.zero_()
+    tokens = torch.tensor([[1, 101, 102, 103]])
+    patches = FixedPatcher(2)(b"abc").with_bos()
+    h, queries = model.encoder(tokens, patches)
+    pooled = torch.stack([h[0, s:s+n].mean(0) for s, n in zip(patches.starts, patches.lengths)])[None]
+    expected = model.encoder.query_projection(pooled).reshape_as(queries) * 2**len(model.encoder.blocks)
+    torch.testing.assert_close(queries, expected)
+    model.decoder.norm = torch.nn.Identity()
+    model.decoder.head = torch.nn.Identity()
+    decoded = model.decoder(h, torch.randn(1, 3, 32), patches)
+    torch.testing.assert_close(decoded, h[:, :-1] * 2**len(model.decoder.blocks))

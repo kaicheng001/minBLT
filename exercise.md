@@ -2,7 +2,6 @@
 
 Build a Byte Latent Transformer one causal boundary at a time. Use the included
 [minbpe corpus](tests/taylorswift.txt); its attribution is in [README.md](README.md).
-These exercises are original and concern BLT rather than BPE merge learning.
 
 ### Step 1: bytes
 
