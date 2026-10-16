@@ -1,0 +1,24 @@
+The little byte workshop opens at 08:30. A lamp glows above a clean wooden table.
+Ada writes a pattern: red blue red blue, 1 2 3, red blue red blue, 1 2 3.
+Ben reads it aloud. A byte is a number; a patch is a group of bytes.
+The group has no dictionary entry. Its meaning comes from the surrounding story.
+
+Outside, rain taps the window: tap, tap, pause; tap, tap, pause.
+Inside, the notebook says: Better than BPE? First test the idea carefully!
+Predict the next byte from the past. Never borrow a letter from tomorrow.
+Finish one patch, remember its shape, then begin the next small patch.
+
+At noon they share a café snack. The price is €3, and the circle is marked π.
+A snowman ☃ smiles on the page. These symbols occupy several UTF-8 bytes.
+The bytes can cross a patch boundary. The original bytes still fit together.
+Numbers repeat: 10, 20, 30; 10, 20, 30. Spaces and commas matter too.
+
+Ada writes a second pattern: green gold green gold, 4 5 6, green gold green gold.
+Ben checks every boundary. No byte is missing; no byte is counted twice.
+The first prediction starts with empty context. Later predictions remember the past.
+A short experiment teaches a small lesson. A careful test makes the lesson useful.
+
+In the evening the lamp glows again. Rain taps, pencils move, and pages turn.
+Red blue red blue, 1 2 3. Green gold green gold, 4 5 6.
+Tomorrow brings another sequence. For now, save the model and close the notebook.
+The little byte workshop closes at 18:30, ready for another careful experiment.
