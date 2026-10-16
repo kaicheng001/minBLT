@@ -32,7 +32,15 @@ class TinyEntropyModel(nn.Module):
         if not len(values):
             return torch.empty(0, device=device)
         self.eval()
-        x = torch.as_tensor(list(values), dtype=torch.long, device=device)[None]
-        logits, _ = self(x)
-        logp = logits[0].log_softmax(-1)
-        return -(logp.exp() * logp).sum(-1)
+        raw = list(values)
+        entropies = []
+        for t in range(len(raw)):
+            # Canonical prefix shape matters: differently sized float32 matrix
+            # products can round differently and flip a hard threshold at a tie.
+            # Use exactly the same computation offline and online, including the
+            # dummy target, whose value is excluded by the shifted input stream.
+            x = torch.tensor([raw[:t] + [0]], dtype=torch.long, device=device)
+            logits, _ = self(x)
+            logp = logits[0, -1].log_softmax(-1)
+            entropies.append(-(logp.exp() * logp).sum())
+        return torch.stack(entropies)

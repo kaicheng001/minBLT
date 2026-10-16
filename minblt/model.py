@@ -21,11 +21,11 @@ class HashEmbedding(nn.Module):
         result = 0
         for n, table in zip(self.lengths, self.tables):
             hashes = torch.zeros_like(x)
-            # h[t] = sum(x[t-i] * 257**i) mod buckets. Reduce each term
+            # h[t] = sum(x[t-i] * 263**i) mod buckets. Reduce each term
             # before multiplication, avoiding integer overflow for long n-grams.
             for i in range(min(n, x.shape[1])):
                 hashes[:, i:] = (hashes[:, i:] + x[:, :x.shape[1]-i]
-                                  * pow(257, i, self.buckets)) % self.buckets
+                                  * pow(263, i, self.buckets)) % self.buckets
             embedding = table(hashes)
             valid = torch.arange(x.shape[1], device=x.device) >= n-1
             result = result + embedding * valid[None, :, None]
