@@ -146,14 +146,14 @@ The projects and authors named here do not endorse MiniBLT.
 
 ## License
 
+The new MiniBLT software is MIT licensed; see [LICENSE](LICENSE).
 Upstream minbpe and minbpe-pytorch software is MIT; Meta BLT code is
 [CC BY-NC 4.0](https://github.com/facebookresearch/blt/blob/9774ed4fcc78313f9f218295f3d7e4decdadf2ae/LICENSE).
-No software license for this new implementation is asserted; the repository owner
-must choose its terms.
+The independently written implementation does not relicense those projects.
 
 The corpus is separately attributed to [Wikipedia's Taylor Swift contributors](https://en.wikipedia.org/wiki/Taylor_Swift)
 ([history](https://en.wikipedia.org/w/index.php?title=Taylor_Swift&action=history)),
 copied by minbpe on February 16, 2024 and redistributed here byte-for-byte under
 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), as its preserved
 footer states. Its exact source is the [pinned minbpe data file](https://github.com/karpathy/minbpe/blob/1acefe89412b20245db5a22d2a02001e547dc602/tests/taylorswift.txt).
-The software's MIT notices do not relicense Wikipedia text.
+The software's MIT license does not relicense Wikipedia text.
