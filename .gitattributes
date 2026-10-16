@@ -1,0 +1,2 @@
+# Preserve the verified upstream corpus byte-for-byte on every platform.
+tests/taylorswift.txt -text

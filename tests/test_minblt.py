@@ -1,4 +1,6 @@
 import math
+import hashlib
+from pathlib import Path
 
 import pytest
 import torch
@@ -241,3 +243,102 @@ def test_invalid_patch_metadata(starts, size):
 def test_invalid_byte_batches(x):
     with pytest.raises(ValueError):
         small_model()(torch.tensor(x), FixedPatcher(2))
+
+
+def test_original_minbpe_dataset():
+    from train import DEFAULT_DATA
+    raw = (Path(__file__).parent / "taylorswift.txt").read_bytes()
+    assert len(raw) == 185768
+    assert hashlib.sha256(raw).hexdigest() == "c2e39cb822d4ae0caac22152cefc306d466e31217a9c5524e493ad2b76792f57"
+    assert DEFAULT_DATA == "tests/taylorswift.txt"
+
+
+def test_rope_scalar_reference():
+    from minblt import base
+    x = torch.tensor([[[[1., 2., 3., 4.], [2., 1., 4., 3.]]]])
+    actual = base.rope(x)
+    expected = x.clone()
+    for t in range(2):
+        for pair in range(2):
+            angle = t * 10000**(-2*pair/4)
+            a, b = x[0, 0, t, 2*pair:2*pair+2].tolist()
+            expected[0, 0, t, 2*pair] = a*math.cos(angle)-b*math.sin(angle)
+            expected[0, 0, t, 2*pair+1] = a*math.sin(angle)+b*math.cos(angle)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual.square().sum(-1), x.square().sum(-1))
+
+
+def test_distribution_entropy():
+    from minblt.entropy import entropy
+    assert entropy(torch.zeros(3, 256)).tolist() == pytest.approx([math.log(256)]*3)
+    logits = torch.full((256,), -100.)
+    logits[10] = 100
+    assert entropy(logits).item() < 1e-6
+    logits = torch.tensor([0.2, -0.7, 1.1], dtype=torch.float64)
+    weights = [math.exp(v) for v in logits.tolist()]
+    probabilities = [w/sum(weights) for w in weights]
+    assert entropy(logits).item() == pytest.approx(-sum(p*math.log(p) for p in probabilities))
+
+
+def test_reference_initial_patch_and_decoder_ids():
+    from minblt.patch import decoder_patch_ids
+    raw = Patches.build([0, 3, 5], 7)
+    internal = raw.with_bos()
+    assert internal.starts == [0, 1, 4, 6]
+    assert internal.lengths == [1, 3, 2, 2]
+    assert internal.ids == [0, 1, 1, 1, 2, 2, 3, 3]
+    assert decoder_patch_ids(internal) == [0, 0, 0, 1, 1, 2, 2]
+    # Meta find_entropy_patch_start_ids uses initial encoder starts [0,1].
+    # Its monotonic helper additionally forces its first surviving candidate.
+    h = [1., 1.2, 3., 2., 3.5]
+    assert EntropyPatcher(None, 1., policy="relative").from_entropies(h).starts == [0, 1, 2, 4]
+    assert EntropyPatcher(None, 99., policy="relative").from_entropies(h).starts == [0, 1]
+    assert EntropyPatcher(None, 99.).from_entropies(h).with_bos().lengths == [1, 5]
+
+
+def test_patch_masks_independent():
+    from minblt.patch import patch_mask
+    q = torch.tensor([0, 0, 1, 1, 2, 2])
+    k = torch.tensor([0, 1, 1, 2])
+    expected = [[a == b for b in k.tolist()] for a in q.tolist()]
+    assert patch_mask(q, k)[0].tolist() == expected
+    expected = [[0 <= a-b < 2 for b in k.tolist()] for a in q.tolist()]
+    assert patch_mask(q, k, window=2)[0].tolist() == expected
+
+
+@pytest.mark.parametrize("n", [1, 3, 5, 8])
+@pytest.mark.parametrize("function", [0, 1])
+def test_hash_scalar_reference(n, function):
+    from minblt.blt import byte_hash
+    # Internal symbols use Meta's offset=4 and BOS=1; zero left padding is BOE.
+    values = [1, 4, 259, 5, 42, 190, 255, 128]
+    prime = [1000000007, 5915587277][function]
+    expected = []
+    for t in range(len(values)):
+        gram = ([0]*(n-1) + values[:t+1])[-n:]
+        integer = sum(v*prime**i for i, v in enumerate(gram)) % (1 << 64)
+        if integer >= 1 << 63:
+            integer -= 1 << 64
+        expected.append(integer % 509)
+    assert byte_hash(torch.tensor([values]), n, 509, function).tolist() == [expected]
+
+
+@pytest.mark.parametrize("queries", [1, 2, 3])
+def test_multiple_patch_queries_and_layers(queries):
+    model = ByteLatentTransformer(local_dim=16, global_dim=32, encoder_layers=2,
+                                 decoder_layers=2, global_layers=3, cross_attn_k=queries,
+                                 ngrams=(3, 4), hash_buckets=64)
+    raw = b"abcdefgh"
+    patches = FixedPatcher(3)(raw).with_bos()
+    internal = torch.tensor([[1]+[b+4 for b in raw]])
+    h, p = model.encoder(internal, patches)
+    assert h.shape == (1, 9, 16)
+    assert p.shape == (1, 4, queries, 16)
+    assert len(model.encoder.blocks) == len(model.decoder.blocks) == 2
+    x = torch.tensor([list(raw)])
+    _, loss = model(x, FixedPatcher(3))
+    loss.backward()
+    for module in [model.encoder, model.global_model, model.decoder]:
+        for name, parameter in module.named_parameters():
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+            assert parameter.grad.abs().sum() > 0, name
