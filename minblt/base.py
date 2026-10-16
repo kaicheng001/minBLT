@@ -90,8 +90,13 @@ class Attention(nn.Module):
         query, key, value = split(self.q(x)), split(self.k(context)), split(self.v(context))
         if self.rotary:
             query, key = rope(query, self.rope_theta), rope(key, self.rope_theta)
-        # SDPA Boolean True means allow. Empty query rows produce zero output.
-        values = F.scaled_dot_product_attention(query, key, value, attn_mask=allow[:, None])
+        # SDPA Boolean True means allow. Give empty rows a temporary finite
+        # softmax, then zero them: older CPU SDPA versions can return NaNs for
+        # all-masked rows. This also keeps padding-query behavior explicit.
+        active = allow.any(-1, keepdim=True)
+        safe_allow = allow | ~active
+        values = F.scaled_dot_product_attention(query, key, value, attn_mask=safe_allow[:, None])
+        values = values * active[:, None]
         return self.out(values.transpose(1, 2).reshape(b, q, d))
 
 
